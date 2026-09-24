@@ -194,6 +194,7 @@ void video_definir_cabecalhos(const char *cabs) { (void)cabs; }
 int  video_tem_atmos(void) { return 0; }
 int  video_tem_dolby_vision(void) { return 0; }
 const char *video_hdr(void) { return "none"; }
+int  video_dv_diagnostico(char *d, int t) { (void)t; if (d) d[0] = 0; return 0; }
 int  video_largura(void) { return 0; }
 int  video_altura(void) { return 0; }
 int  video_pode_forcar_sdr(void) { return 0; }
@@ -383,6 +384,11 @@ static int dvPedido;
 // dvArquivo: -1 = nao lido (sonda nao rodou, falhou ou passou do prazo);
 // senao MKV_DV_SEM / MKV_DV_DECLARAR / MKV_DV_RECUSAR, e dvPerfilArq o perfil.
 static int dvArquivo = -1, dvPerfilArq;
+// Para o selo (video_dv_diagnostico): se a sonda rodou e como terminou, o
+// perfil como se escreve ("8.1", "7+EL") e se o /tmp/nuvio-dv.conf mandou.
+enum { DV_SONDA_NAO = 0, DV_SONDA_PRAZO, DV_SONDA_LIDA };
+static int  dvSondaEstado, dvForcado;
+static char dvPerfilTxt[12];
 // Load adiado enquanto a sonda le o cabecalho. video_bombear o dispara quando
 // a sonda volta ou quando o prazo vence — o que vier primeiro.
 static int      cargaPendente;
@@ -392,6 +398,7 @@ static long     cargaPrazo;
 static pthread_mutex_t dvMx = PTHREAD_MUTEX_INITIALIZER;
 static unsigned dvGerSonda, dvGerPronta;
 static int      dvResultado, dvResultadoPerfil;
+static char     dvResultadoTxt[12];
 // O cabecalho que a sonda baixou fica guardado para o lerMkv (idioma das
 // legendas, capitulos) nao baixar os mesmos 320 KB de novo — com o video ja
 // tocando, que e justamente quando a descida custa (ver mkv.c).
@@ -1514,7 +1521,18 @@ static void *sondarDv(void *arg) {
   static MkvCap   caps[MKV_MAX_CAPS];   // (ver video_tocar) — static poupa a pilha
   int nCaps = 0, perfil = 0, dec = -1;
   int n = mkv_faixas_e_caps(sd->url, fx, MKV_MAX_FAIXAS, caps, MKV_MAX_CAPS, &nCaps);
-  if (n > 0) dec = mkv_dv_decidir(fx, n, &perfil);
+  char txt[12] = "";
+  if (n > 0) {
+    int i;
+    dec = mkv_dv_decidir(fx, n, &perfil);
+    for (i = 0; i < n; i++) if (fx[i].tipo == 1 && fx[i].dvPerfil > 0) {
+      // "8.1" e o nome do perfil 8 com base HDR10; nos demais o numero basta.
+      if (fx[i].dvPerfil == 8) snprintf(txt, sizeof txt, "8.%d", fx[i].dvCompat);
+      else snprintf(txt, sizeof txt, "%d", fx[i].dvPerfil);
+      if (fx[i].dvEl) snprintf(txt + strlen(txt), sizeof txt - strlen(txt), "+EL");
+      break;
+    }
+  }
   pthread_mutex_lock(&dvMx);
   if (n > 0) {
     snprintf(cacheMkvUrl, sizeof cacheMkvUrl, "%s", sd->url);
@@ -1523,6 +1541,7 @@ static void *sondarDv(void *arg) {
     cacheN = n; cacheNCaps = nCaps;
   }
   dvResultado = dec; dvResultadoPerfil = perfil;
+  snprintf(dvResultadoTxt, sizeof dvResultadoTxt, "%s", txt);
   dvGerPronta = sd->ger;
   pthread_mutex_unlock(&dvMx);
   free(sd);
@@ -1553,6 +1572,7 @@ int video_tocar(const char *url) {
   creditosNomeado = creditosUltimo = 0.0;
   snprintf(urlAtual, sizeof urlAtual, "%s", url ? url : "");
   dvArquivo = -1; dvPerfilArq = 0;
+  dvSondaEstado = DV_SONDA_NAO; dvForcado = 0; dvPerfilTxt[0] = 0;
   cargaPendente = 0;
   // Uma sonda anterior ainda rodando (servidor lento, prazo vencido) nao e
   // esperada: esta fonte toca sem ler, como antes. Evita empilhar fios.
@@ -1594,11 +1614,15 @@ void video_bombear(void) {
   if (cargaPendente) {
     int voltou = 0, res = -1, perfil = 0;
     pthread_mutex_lock(&dvMx);
-    if (dvGerPronta == dvGerSonda) { voltou = 1; res = dvResultado; perfil = dvResultadoPerfil; }
+    if (dvGerPronta == dvGerSonda) {
+      voltou = 1; res = dvResultado; perfil = dvResultadoPerfil;
+      snprintf(dvPerfilTxt, sizeof dvPerfilTxt, "%s", dvResultadoTxt);
+    }
     pthread_mutex_unlock(&dvMx);
     if (voltou || agoraMs() >= cargaPrazo) {
       cargaPendente = 0;
       dvArquivo = res; dvPerfilArq = perfil;
+      dvSondaEstado = voltou ? DV_SONDA_LIDA : DV_SONDA_PRAZO;
       printf("[video] sonda de DV: %s (perfil %d)\n",
              !voltou ? "prazo vencido, load sem declaracao" :
              res == MKV_DV_DECLARAR ? "declarar" :
@@ -1825,14 +1849,18 @@ static int tocarInterno(const char *url, int comDV) {
     //   echo "off"      > /tmp/nuvio-dv.conf   nunca declara
     //   rm /tmp/nuvio-dv.conf                  volta a decidir pelo arquivo
     static char pAuto[8];
-    const char *origem = NULL;
+    int declarar = 0;
     if (perfil && *perfil) {
-      if (strcmp(perfil, "off")) origem = "forcado por /tmp/nuvio-dv.conf ou ambiente";
+      if (strcmp(perfil, "off")) {
+        declarar = 1;
+        dvForcado = 1;
+        snprintf(dvPerfilTxt, sizeof dvPerfilTxt, "%s", perfil);
+      }
     } else if (dvArquivo == MKV_DV_DECLARAR) {
       snprintf(pAuto, sizeof pAuto, "%d", dvPerfilArq);
       perfil = pAuto;
       trilha = "single";
-      origem = "lido do cabecalho do MKV";
+      declarar = 1;
     } else if (dvArquivo == MKV_DV_RECUSAR || dvArquivo == MKV_DV_SEM) {
       // O cabecalho foi LIDO e desmente o DV que este modo entrega. Sem isto o
       // bind descreveria DolbyVision ao tv.display e so recuaria para HDR10
@@ -1843,12 +1871,14 @@ static int tocarInterno(const char *url, int comDV) {
              dvPerfilArq);
       fflush(stdout);
     }
-    if (origem) {
+    if (declarar) {
       snprintf(dolby, sizeof dolby,
                "\"externalStreamingInfo\":{\"contents\":{\"DolbyHdrInfo\":{"
                "\"encryptionType\":\"clear\",\"profileId\":%s,\"trackType\":\"%s\"}}},",
                perfil, (trilha && *trilha) ? trilha : "single");
-      printf("[video] DolbyHdrInfo declarado (%s): %s\n", origem, dolby); fflush(stdout);
+      printf("[video] DolbyHdrInfo declarado (%s): %s\n",
+             dvForcado ? "forcado por /tmp/nuvio-dv.conf ou ambiente" : "lido do cabecalho do MKV",
+             dolby); fflush(stdout);
       dvNaCarga = 1;
     }
   }
@@ -2179,6 +2209,26 @@ int  video_tem_dolby_vision(void) {
 // hdrType cru do pipeline, para a tela poder dizer "HDR10" quando for HDR10 em
 // vez de calar. "none" quando o fluxo e SDR ou ainda nao se sabe.
 const char *video_hdr(void)       { return vidHdr; }
+int  video_dv_diagnostico(char *dst, int tam) {
+  const char *f = NULL;
+  if (!dst || tam < 1) return 0;
+  dst[0] = 0;
+  if (!dvPedido || !urlAtual[0]) return 0;
+  if (dvForcado)                          f = i18n("DV forçado: perfil %s");
+  else if (dvSondaEstado == DV_SONDA_PRAZO) f = i18n("DV do arquivo: cabeçalho não chegou a tempo");
+  else if (dvSondaEstado != DV_SONDA_LIDA) {
+    // Sonda nem rodou (link com cara de MP4/HLS, ou sonda anterior ainda
+    // viva). Se o pipeline ja deu DV, o selo acima basta; senao, dizer.
+    if (video_tem_dolby_vision()) return 0;
+    f = i18n("DV do arquivo: não verificado");
+  }
+  else if (dvArquivo == MKV_DV_DECLARAR)  f = i18n("DV do arquivo: perfil %s, pedido à TV");
+  else if (dvArquivo == MKV_DV_RECUSAR)   f = i18n("DV do arquivo: perfil %s, sem suporte aqui");
+  else if (dvArquivo == MKV_DV_SEM)       f = i18n("DV do arquivo: sem registro de DV");
+  else                                    f = i18n("DV do arquivo: cabeçalho ilegível");
+  snprintf(dst, (size_t)tam, f, dvPerfilTxt[0] ? dvPerfilTxt : "?");
+  return 1;
+}
 int  video_largura(void)          { return vidW; }
 int  video_altura(void)           { return vidH; }
 

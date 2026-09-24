@@ -222,6 +222,12 @@ int  video_tem_atmos(void);
 // (video_definir_dv) nao entra aqui de proposito: ver o comentario em video.c.
 int  video_tem_dolby_vision(void);
 const char *video_hdr(void);   // hdrType cru: "none", "HDR10", "DolbyVision"...
+// O que o app decidiu sobre o Dolby Vision DO ARQUIVO (sonda do cabecalho do
+// MKV, ver video_tocar em video.c), numa linha para o selo do player. 0 quando
+// nao ha o que dizer (fonte nao anunciada como DV, ou alvo sem sonda). Existe
+// porque o selo HDR10 sozinho nao separa "o arquivo e perfil 7", "o cabecalho
+// nao chegou a tempo" e "pedimos DV e a TV ignorou" — tres causas, tres saidas.
+int  video_dv_diagnostico(char *dst, int tam);
 // Dimensoes do QUADRO decodificado, do videoInfo. Sao elas que dao a proporcao
 // usada pelos modos de zoom do player.
 int  video_largura(void);

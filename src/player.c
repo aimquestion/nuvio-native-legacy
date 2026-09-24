@@ -2656,9 +2656,10 @@ void player_desenhar(Uint32 agora) {
   // faixa estereo. Selo que mente e pior que selo ausente, porque e nele que o
   // dono confia para saber se pegou a versao boa.
   {
-    const char *selos[3];
+    const char *selos[4];
     int nSelos = 0;
     char res[16] = "";
+    char dvArq[96];
     if (video_largura() >= 3840)      snprintf(res, sizeof res, "4K");
     else if (video_largura() >= 1920) snprintf(res, sizeof res, "HD");
     if (res[0]) selos[nSelos++] = res;
@@ -2684,6 +2685,10 @@ void player_desenhar(Uint32 agora) {
     }
 #endif
     if (video_tem_atmos())        selos[nSelos++] = "Dolby Atmos";
+    // O porque do selo acima, quando a fonte foi anunciada como DV: o perfil
+    // lido do MKV e se ele foi pedido a TV. "HDR10" sozinho nao separa perfil
+    // 7, cabecalho que nao chegou e TV que ignorou o pedido (video.h).
+    if (video_dv_diagnostico(dvArq, (int)sizeof dvArq)) selos[nSelos++] = dvArq;
 
     // RELOGIO e "Termina as", que sao o que o web poe neste canto
     // (.player-controls-top, playerScreen.js:5846). Os selos de qualidade sao

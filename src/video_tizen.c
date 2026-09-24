@@ -1341,6 +1341,8 @@ int  video_legenda_atual(void) { return legAtual; }
 int  video_tem_atmos(void)        { return 0; }
 int  video_tem_dolby_vision(void) { return 0; }
 const char *video_hdr(void)       { return "desconhecido"; }
+// O AVPlay decide o HDR sozinho e nao ha sonda de DV aqui (ver video.c).
+int  video_dv_diagnostico(char *d, int t) { (void)t; if (d) d[0] = 0; return 0; }
 
 int  video_largura(void)          { return vidW; }
 int  video_altura(void)           { return vidH; }
