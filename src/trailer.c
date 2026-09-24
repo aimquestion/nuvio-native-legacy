@@ -248,6 +248,9 @@ void trailer_abrir(const char *fonte, GfxRect r, int som, int modoCheia) {
   if (!trailer_js_abrir(fonte, r.x, r.y, r.w, r.h, som, ajustes_trailer_zoom())) return;
 #else
   if (nova) {
+    // Trailer nunca e fonte DV. A afirmacao que sobrou do ultimo titulo faria
+    // o video_tocar esperar a sonda de DV do cabecalho a toa (ver video.c).
+    video_definir_dv(0);
     if (!video_tocar(fonte)) return;
     volumePendente = 1; recortePendente = 1; pausado = 0; reaplicarAte = 0;
     tocandoDesde = 0; quadroInteiroEnviado = 0;

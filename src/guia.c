@@ -1243,6 +1243,9 @@ static void previewAplicarPend(void) {
   if (previewCancelar || !previewLigado || !aberta) { previewUrlPend[0] = 0; return; }
   // O LS2 aceita uma mediaId so: parar limpa o anterior antes de tocar.
   video_parar();
+  // Canal ao vivo nao e fonte DV: sem isto a afirmacao do ultimo titulo
+  // seguraria o preview na sonda de DV do cabecalho (ver video.c).
+  video_definir_dv(0);
   if (video_tocar(previewUrlPend)) {
     previewAtivo = 1;
     video_janela((int)(G_PREVIEW_X + 0.5f), (int)(G_PREVIEW_Y + 0.5f),

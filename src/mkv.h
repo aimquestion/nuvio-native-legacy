@@ -26,6 +26,12 @@ typedef struct {
   char idioma[8];     // "por", "eng"... vazio quando o arquivo nao etiqueta
   char nome[48];      // Name, quando existe ("Forced", "SDH", "Full")
   char codec[24];     // CodecID ("S_TEXT/UTF8", "S_HDMV/PGS")
+  // Registro de configuracao do Dolby Vision (dvcC/dvvC), do
+  // BlockAdditionMapping da faixa de VIDEO. dvPerfil 0 = a faixa nao traz um.
+  // Ver mkv_dv_decidir.
+  int  dvPerfil;      // 5, 7, 8...
+  int  dvCompat;      // bl_signal_compatibility_id: 1 = base HDR10 (o "8.1")
+  int  dvRpu, dvEl, dvBl;   // camadas presentes: metadado, realce, base
 } MkvFaixa;
 
 #define MKV_MAX_CAPS 64
@@ -85,5 +91,24 @@ double mkv_creditos_nomeados(const MkvCap *caps, int n);
 enum { MKV_CASA_NADA = 0, MKV_CASA_ORDINAL = 1, MKV_CASA_NUMERO = 2 };
 int mkv_casar_legendas(const MkvFaixa *fx, int n, const int *tvNum, int nTv,
                        int *idxFx);
+
+// --- DOLBY VISION: declarar ou nao, decidido pelo ARQUIVO --------------------
+//
+// O webOS 4 nao le o registro de DV de um MKV, entao o app tem de dizer o
+// perfil no load (DolbyHdrInfo, ver video.c). MEDIDO na C9: declarar o perfil
+// errado nao falha, fica SEM IMAGEM com o audio correndo, e o uMS nao da sinal
+// nenhum disso. Por isso a declaracao sai do registro dvcC/dvvC que o proprio
+// arquivo carrega, e so nos casos em que ha uma camada so:
+//
+//   MKV_DV_DECLARAR  perfil 5, ou 8 com base HDR10 (8.1), sem camada de
+//                    realce: declarar `perfil` / "single".
+//   MKV_DV_RECUSAR   o arquivo tem DV, mas num formato que o modo URI nao
+//                    entrega ao decoder (perfil 7 com camada de realce no mesmo
+//                    fluxo, 8.2/8.4, 4...). Tocar como HDR10: com imagem.
+//   MKV_DV_SEM       o cabecalho foi lido e nao ha DV. O rotulo do addon mentiu.
+//
+// Puro: sem rede, sem estado — tests/mkv_dv.sh exercita.
+enum { MKV_DV_SEM = 0, MKV_DV_DECLARAR = 1, MKV_DV_RECUSAR = 2 };
+int mkv_dv_decidir(const MkvFaixa *fx, int n, int *perfil);
 
 #endif

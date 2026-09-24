@@ -94,6 +94,50 @@ static void lerTexto(const unsigned char *p, long n, char *dst, size_t tam) {
 #define ID_LANG_BCP47  0x22B59DUL     // LanguageBCP47 ("pt-BR"), mais novo
 #define ID_NAME        0x536EUL
 #define ID_CODECID     0x86UL
+#define ID_BLOCKADDMAP 0x41E4UL       // BlockAdditionMapping, filho de TrackEntry
+#define ID_BLOCKADDTYP 0x41E7UL       // BlockAddIDType: o fourcc do registro
+#define ID_BLOCKADDDAT 0x41EDUL       // BlockAddIDExtraData: o registro em si
+
+// Os tres nomes do registro de configuracao do Dolby Vision. O conteudo e o
+// mesmo DOVIDecoderConfigurationRecord; o nome so diz a faixa de perfis
+// (dvcC ate o 7, dvvC do 8 ao 10, dvwC acima).
+#define FOURCC_DVCC 0x64766343UL
+#define FOURCC_DVVC 0x64767643UL
+#define FOURCC_DVWC 0x64767743UL
+
+// BlockAdditionMapping { BlockAddIDType, BlockAddIDExtraData }. So preenche a
+// faixa quando o tipo e um dos registros de DV; qualquer outro mapeamento (ITU
+// T.35 do HDR10+, por exemplo) passa em branco.
+//
+// Layout do registro (ETSI / especificacao Dolby "ISOBMFF"), bits a partir do
+// terceiro byte:  dv_profile:7 dv_level:6 rpu:1 el:1 bl:1 compat:4 ...
+// Os dois primeiros bytes sao a versao e nao interessam aqui.
+static void lerMapaDv(const unsigned char *p, long n, MkvFaixa *f) {
+  long o = 0;
+  unsigned long tipo = 0;
+  const unsigned char *reg = NULL;
+  long regTam = 0;
+  while (o < n) {
+    int ui = 0, ut = 0;
+    unsigned long id = lerId(p + o, n - o, &ui);
+    long tam;
+    if (!id) break;
+    tam = lerTam(p + o + ui, n - o - ui, &ut);
+    if (tam < 0) break;
+    o += ui + ut;
+    if (o + tam > n) break;
+    if (id == ID_BLOCKADDTYP) tipo = lerUint(p + o, tam);
+    else if (id == ID_BLOCKADDDAT) { reg = p + o; regTam = tam; }
+    o += tam;
+  }
+  if (tipo != FOURCC_DVCC && tipo != FOURCC_DVVC && tipo != FOURCC_DVWC) return;
+  if (!reg || regTam < 5) return;
+  f->dvPerfil = (reg[2] >> 1) & 0x7F;
+  f->dvRpu    = (reg[3] >> 2) & 1;
+  f->dvEl     = (reg[3] >> 1) & 1;
+  f->dvBl     =  reg[3]       & 1;
+  f->dvCompat = (reg[4] >> 4) & 0x0F;
+}
 
 // Le os TrackEntry de dentro de um Tracks ja localizado.
 static int lerTracks(const unsigned char *p, long n, MkvFaixa *saida, int max) {
@@ -131,7 +175,8 @@ static int lerTracks(const unsigned char *p, long n, MkvFaixa *saida, int max) {
               lerTexto(v, ftam, f.idioma, sizeof f.idioma);
           }
           else if (fid == ID_NAME)    lerTexto(v, ftam, f.nome,  sizeof f.nome);
-          else if (fid == ID_CODECID) lerTexto(v, ftam, f.codec, sizeof f.codec); }
+          else if (fid == ID_CODECID) lerTexto(v, ftam, f.codec, sizeof f.codec);
+          else if (fid == ID_BLOCKADDMAP) lerMapaDv(v, ftam, &f); }
         q += ftam;
       }
       if (f.numero > 0) saida[achou++] = f;
@@ -353,4 +398,25 @@ int mkv_casar_legendas(const MkvFaixa *fx, int n, const int *tvNum, int nTv,
   if (ok) return MKV_CASA_NUMERO;
   for (i = 0; i < nTv; i++) idxFx[i] = -1;
   return MKV_CASA_NADA;
+}
+
+// Ver a nota em mkv.h. A regra e estreita de proposito: so declara o que tem
+// uma camada so e base conhecida. O custo de errar para o lado de NAO declarar
+// e HDR10 com imagem; o de errar para o outro lado e tela preta.
+int mkv_dv_decidir(const MkvFaixa *fx, int n, int *perfil) {
+  int i;
+  if (perfil) *perfil = 0;
+  if (!fx) return MKV_DV_SEM;
+  for (i = 0; i < n; i++) {
+    const MkvFaixa *f = &fx[i];
+    if (f->tipo != 1 || f->dvPerfil <= 0) continue;
+    if (perfil) *perfil = f->dvPerfil;
+    // Sem RPU nao ha metadado de DV nenhum; com EL a camada de realce vem no
+    // mesmo fluxo e o modo URI nao a separa — os dois quebraram na C9.
+    if (!f->dvRpu || f->dvEl || !f->dvBl) return MKV_DV_RECUSAR;
+    if (f->dvPerfil == 5) return MKV_DV_DECLARAR;
+    if (f->dvPerfil == 8 && f->dvCompat == 1) return MKV_DV_DECLARAR;
+    return MKV_DV_RECUSAR;
+  }
+  return MKV_DV_SEM;
 }

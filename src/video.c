@@ -379,6 +379,27 @@ static int nAudio, nLeg, audioAtual, legAtual = -1;
 // tocar, porque o video_tocar zera vidDV ao comecar uma sessao nova.
 static int dvPedido;
 
+// DV LIDO DO ARQUIVO, e nao do rotulo do addon. Ver a nota em video_tocar.
+// dvArquivo: -1 = nao lido (sonda nao rodou, falhou ou passou do prazo);
+// senao MKV_DV_SEM / MKV_DV_DECLARAR / MKV_DV_RECUSAR, e dvPerfilArq o perfil.
+static int dvArquivo = -1, dvPerfilArq;
+// Load adiado enquanto a sonda le o cabecalho. video_bombear o dispara quando
+// a sonda volta ou quando o prazo vence — o que vier primeiro.
+static int      cargaPendente;
+static long     cargaPrazo;
+// A sonda roda num fio; o resultado so vale para a geracao que a pediu. Trocar
+// de fonte no meio deixa o fio antigo terminar e escrever para ninguem.
+static pthread_mutex_t dvMx = PTHREAD_MUTEX_INITIALIZER;
+static unsigned dvGerSonda, dvGerPronta;
+static int      dvResultado, dvResultadoPerfil;
+// O cabecalho que a sonda baixou fica guardado para o lerMkv (idioma das
+// legendas, capitulos) nao baixar os mesmos 320 KB de novo — com o video ja
+// tocando, que e justamente quando a descida custa (ver mkv.c).
+static char     cacheMkvUrl[1024];
+static MkvFaixa cacheFx[MKV_MAX_FAIXAS];
+static MkvCap   cacheCaps[MKV_MAX_CAPS];
+static int      cacheN, cacheNCaps;
+
 // O nome legivel do idioma mora em linguas.c: addons.c precisava da mesma
 // tabela e mantinha uma propria, com tres idiomas.
 
@@ -1355,7 +1376,16 @@ static void *lerMkv(void *arg) {
 
   snprintf(url, sizeof url, "%s", urlAtual);
 
-  n = mkv_faixas_e_caps(url, fx, MKV_MAX_FAIXAS, caps, MKV_MAX_CAPS, &nCaps);
+  n = 0;
+  pthread_mutex_lock(&dvMx);
+  if (cacheN > 0 && !strcmp(cacheMkvUrl, url)) {
+    n = cacheN; nCaps = cacheNCaps;
+    memcpy(fx, cacheFx, sizeof fx);
+    memcpy(caps, cacheCaps, sizeof caps);
+  }
+  pthread_mutex_unlock(&dvMx);
+  if (n > 0) printf("[mkv] cabecalho reaproveitado da sonda de DV\n");
+  else n = mkv_faixas_e_caps(url, fx, MKV_MAX_FAIXAS, caps, MKV_MAX_CAPS, &nCaps);
   if (nCaps > 0) {
     creditosNomeado = mkv_creditos_nomeados(caps, nCaps);
     creditosUltimo  = nCaps > 1 ? caps[nCaps - 1].inicio : 0.0;
@@ -1463,6 +1493,55 @@ static long agoraMs(void) {
 
 static int tocarInterno(const char *url, int comDV);
 
+// --- sonda de Dolby Vision ANTES do load --------------------------------------
+//
+// O perfil tem de ir no load (DolbyHdrInfo, ver tocarInterno), e declarar o
+// perfil errado deixa a C9 sem imagem — sem sinal nenhum do uMS. Entao, para
+// fonte anunciada como DV que pode ser MKV, o load espera o cabecalho: o
+// registro dvcC/dvvC da faixa de video diz o perfil real (mkv_dv_decidir).
+//
+// ANTES e nao durante: aqui a descida nao concorre com a reproducao, porque
+// ainda nao ha reproducao. O custo e o tempo de uma requisicao de Range no
+// inicio, so nas fontes DV. Com prazo: se o servidor demorar, o load sai sem
+// declaracao — o comportamento seguro de antes (HDR10 com imagem).
+#define NV_DV_SONDA_MS 4000
+
+typedef struct { char url[1024]; unsigned ger; } SondaDv;
+
+static void *sondarDv(void *arg) {
+  SondaDv *sd = (SondaDv *)arg;
+  static MkvFaixa fx[MKV_MAX_FAIXAS];   // so um fio de sonda vivo por vez
+  static MkvCap   caps[MKV_MAX_CAPS];   // (ver video_tocar) — static poupa a pilha
+  int nCaps = 0, perfil = 0, dec = -1;
+  int n = mkv_faixas_e_caps(sd->url, fx, MKV_MAX_FAIXAS, caps, MKV_MAX_CAPS, &nCaps);
+  if (n > 0) dec = mkv_dv_decidir(fx, n, &perfil);
+  pthread_mutex_lock(&dvMx);
+  if (n > 0) {
+    snprintf(cacheMkvUrl, sizeof cacheMkvUrl, "%s", sd->url);
+    memcpy(cacheFx, fx, sizeof cacheFx);
+    memcpy(cacheCaps, caps, sizeof cacheCaps);
+    cacheN = n; cacheNCaps = nCaps;
+  }
+  dvResultado = dec; dvResultadoPerfil = perfil;
+  dvGerPronta = sd->ger;
+  pthread_mutex_unlock(&dvMx);
+  free(sd);
+  return NULL;
+}
+
+// HLS, DASH e MP4 nunca tem cabecalho Matroska: sondar seria so atraso.
+static int podeSerMkv(const char *url) {
+  return !strstr(url, ".m3u8") && !strstr(url, ".mpd") && !strstr(url, ".mp4");
+}
+
+static int fioSondaDvVivo(void) {
+  int vivo;
+  pthread_mutex_lock(&dvMx);
+  vivo = dvGerSonda != dvGerPronta;
+  pthread_mutex_unlock(&dvMx);
+  return vivo;
+}
+
 int video_tocar(const char *url) {
   dvRecuado = 0;
   falhou = 0; terminou = 0; audioNaoSup = 0;
@@ -1473,12 +1552,63 @@ int video_tocar(const char *url) {
   // hora sem relacao nenhuma com o que esta tocando.
   creditosNomeado = creditosUltimo = 0.0;
   snprintf(urlAtual, sizeof urlAtual, "%s", url ? url : "");
+  dvArquivo = -1; dvPerfilArq = 0;
+  cargaPendente = 0;
+  // Uma sonda anterior ainda rodando (servidor lento, prazo vencido) nao e
+  // esperada: esta fonte toca sem ler, como antes. Evita empilhar fios.
+  if (url && dvPedido && !fonteMp4 && podeSerMkv(url) && !fioSondaDvVivo()) {
+    SondaDv *sd;
+    pthread_t fio;
+    if (!ligado && !video_iniciar()) return 0;
+    // A fonte anterior nao pode seguir tocando enquanto esta e lida.
+    video_parar();
+    sd = (SondaDv *)malloc(sizeof *sd);
+    if (sd) {
+      snprintf(sd->url, sizeof sd->url, "%s", url);
+      pthread_mutex_lock(&dvMx);
+      sd->ger = ++dvGerSonda;
+      pthread_mutex_unlock(&dvMx);
+      if (pthread_create(&fio, NULL, sondarDv, sd) == 0) {
+        pthread_detach(fio);
+        cargaPendente = 1;
+        cargaPrazo = agoraMs() + NV_DV_SONDA_MS;
+        printf("[video] fonte DV: lendo o perfil no cabecalho antes do load\n");
+        fflush(stdout);
+        return 1;
+      }
+      // Sem fio, a geracao pedida nunca chega: devolve-la mantem
+      // fioSondaDvVivo honesto para a proxima fonte.
+      pthread_mutex_lock(&dvMx);
+      dvGerSonda--;
+      pthread_mutex_unlock(&dvMx);
+      free(sd);
+    }
+  }
   return tocarInterno(url, 1);
 }
 
 // Chamado uma vez por quadro. So existe para o prazo acima: sem ele o recuo
 // dependeria de o usuario perceber que nao ha imagem e sair da tela.
 void video_bombear(void) {
+  // LOAD ADIADO pela sonda de DV (ver video_tocar).
+  if (cargaPendente) {
+    int voltou = 0, res = -1, perfil = 0;
+    pthread_mutex_lock(&dvMx);
+    if (dvGerPronta == dvGerSonda) { voltou = 1; res = dvResultado; perfil = dvResultadoPerfil; }
+    pthread_mutex_unlock(&dvMx);
+    if (voltou || agoraMs() >= cargaPrazo) {
+      cargaPendente = 0;
+      dvArquivo = res; dvPerfilArq = perfil;
+      printf("[video] sonda de DV: %s (perfil %d)\n",
+             !voltou ? "prazo vencido, load sem declaracao" :
+             res == MKV_DV_DECLARAR ? "declarar" :
+             res == MKV_DV_RECUSAR  ? "DV que o modo URI nao entrega, tocar HDR10" :
+             res == MKV_DV_SEM      ? "cabecalho sem registro de DV" :
+                                      "cabecalho nao lido", perfil);
+      fflush(stdout);
+      if (!tocarInterno(urlAtual, 1)) falhou = 1;
+    }
+  }
   // O ACB demora cerca de 1,5 s para ligar uma sessao. Se o usuario sair e
   // reabrir nesse intervalo, o loadCompleted novo encontra bindVivo=1. Antes
   // ele simplesmente desistia para sempre; agora o pedido fica pendente.
@@ -1653,9 +1783,10 @@ static int tocarInterno(const char *url, int comDV) {
   // de saber e medir o hdrType que volta.
   //
   // profileId 8 / "single" e o que o Kodi declara DEPOIS de converter o perfil 7,
-  // nao o que o arquivo tem. Como nao demuxamos, nao sabemos o perfil real; por
-  // isso os valores sao ajustaveis por variavel de ambiente para poder testar
-  // 7/"dual" contra 8/"single" no mesmo arquivo sem recompilar.
+  // nao o que o arquivo tem. Nao demuxamos, mas o perfil real esta no registro
+  // dvcC/dvvC do cabecalho, que a sonda de video_tocar le antes deste load. Os
+  // valores continuam ajustaveis por variavel de ambiente e por arquivo, para
+  // testar 7/"dual" contra 8/"single" no mesmo arquivo sem recompilar.
   char dolby[192] = "";
   dvNaCarga = 0;
   if (dvPedido && comDV) {
@@ -1674,35 +1805,50 @@ static int tocarInterno(const char *url, int comDV) {
         }
         fclose(f);
       } }
-    // DESLIGADO POR PADRAO, e a razao esta medida:
+    // DECIDIDO PELO ARQUIVO, e a razao esta medida:
     //
     //   arquivo A: sem o bloco toca em HDR10; COM o bloco engata Dolby Vision.
     //   varios outros: sem o bloco tocam normal; COM o bloco ficam SEM IMAGEM
     //                  (um chegou a mostrar o primeiro quadro e congelar, com o
     //                  audio correndo).
     //
-    // Ganhar DV num arquivo e perder a imagem em varios e troca ruim. E nao ha
-    // como escolher sozinho: tentei um prazo que recarregaria sem o bloco caso
-    // o pipeline nao reportasse video, e ele NAO SERVE — o uMS reporta videoInfo
-    // (3840x1606, hdrType DolbyVision) e loadCompleted normalmente mesmo quando
-    // nenhum quadro chega ao plano. "Reportou" nao e "exibiu", e nao existe no
-    // uMS um sinal de quadro avancando: currentTime anda com o audio.
+    // E nao ha como descobrir depois: o uMS reporta videoInfo (3840x1606,
+    // hdrType DolbyVision) e loadCompleted normalmente mesmo quando nenhum
+    // quadro chega ao plano. Entao o perfil sai do registro dvcC/dvvC do
+    // proprio MKV, lido ANTES do load (video_tocar), e so se declara o que tem
+    // uma camada so (mkv_dv_decidir): 8.1 e 5. Perfil 7, 8.2/8.4 e arquivo sem
+    // registro nao recebem o bloco e tocam como antes, em HDR10 com imagem.
     //
-    // Entao vira OPT-IN, para experimentar arquivo a arquivo:
-    //   echo "8 single" > /tmp/nuvio-dv.conf   (ou "7 dual")
-    //   rm /tmp/nuvio-dv.conf                  volta ao seguro
-    // O caminho definitivo e saber o perfil real do arquivo antes de afirmar
-    // qualquer coisa: ler o cabecalho do MKV por HTTP Range e achar o
-    // BlockAdditionMapping com dvcC/dvvC, que e onde o Matroska guarda isso.
-    if (!perfil || !*perfil || !strcmp(perfil, "off")) {
-      /* sem declaracao: comportamento conhecido e seguro */
-    } else {
+    // O arquivo de /tmp continua valendo por cima da leitura, para testar a
+    // mao arquivo a arquivo:
+    //   echo "8 single" > /tmp/nuvio-dv.conf   (ou "7 dual") forca o bloco
+    //   echo "off"      > /tmp/nuvio-dv.conf   nunca declara
+    //   rm /tmp/nuvio-dv.conf                  volta a decidir pelo arquivo
+    static char pAuto[8];
+    const char *origem = NULL;
+    if (perfil && *perfil) {
+      if (strcmp(perfil, "off")) origem = "forcado por /tmp/nuvio-dv.conf ou ambiente";
+    } else if (dvArquivo == MKV_DV_DECLARAR) {
+      snprintf(pAuto, sizeof pAuto, "%d", dvPerfilArq);
+      perfil = pAuto;
+      trilha = "single";
+      origem = "lido do cabecalho do MKV";
+    } else if (dvArquivo == MKV_DV_RECUSAR || dvArquivo == MKV_DV_SEM) {
+      // O cabecalho foi LIDO e desmente o DV que este modo entrega. Sem isto o
+      // bind descreveria DolbyVision ao tv.display e so recuaria para HDR10
+      // depois (ver o fallback em prenderPlano) — um vai-e-volta a toa.
+      vidDV = 0;
+      printf("[video] DV do rotulo nao declarado: %s (perfil %d)\n",
+             dvArquivo == MKV_DV_SEM ? "cabecalho sem registro" : "perfil com camada que o modo URI nao entrega",
+             dvPerfilArq);
+      fflush(stdout);
+    }
+    if (origem) {
       snprintf(dolby, sizeof dolby,
                "\"externalStreamingInfo\":{\"contents\":{\"DolbyHdrInfo\":{"
                "\"encryptionType\":\"clear\",\"profileId\":%s,\"trackType\":\"%s\"}}},",
-               (perfil && *perfil) ? perfil : "8",
-               (trilha && *trilha) ? trilha : "single");
-      printf("[video] DolbyHdrInfo declarado: %s\n", dolby); fflush(stdout);
+               perfil, (trilha && *trilha) ? trilha : "single");
+      printf("[video] DolbyHdrInfo declarado (%s): %s\n", origem, dolby); fflush(stdout);
       dvNaCarga = 1;
     }
   }
@@ -1745,6 +1891,7 @@ void video_parar(void) {
   audioAoCarregar = legAoCarregar = -1;
   legUrlAoCarregar[0] = 0;
   pausaPedida = 0; seekEm = 0; mkvPendente = 0;
+  cargaPendente = 0;
   if (ligado && midia[0]) {
     snprintf(b, sizeof b, "{\"mediaId\":\"%s\"}", midia);
     chamar("unload", b, soLog);
